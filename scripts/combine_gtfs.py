@@ -3,9 +3,12 @@ import argparse
 import csv
 import datetime as dt
 import io
+import json
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 import zipfile
 
 PREFIX_COLUMNS = {
@@ -62,6 +65,65 @@ DATE_FIELDS = {
 GTFS_TXT_EXT = ".txt"
 FALLBACK_ENCODINGS = ("utf-8-sig", "cp932", "shift_jis", "latin-1")
 DEFAULT_TIMEZONE = "Asia/Tokyo"
+
+
+class SQLiteFeedStore:
+    def __init__(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.path = Path(self._tempdir.name) / "combined.db"
+        print(f"Using temporary SQLite DB at {self.path}")
+        self.conn = sqlite3.connect(self.path)
+        self.conn.execute(
+            """
+            CREATE TABLE rows (
+                name TEXT NOT NULL,
+                key TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (name, key)
+            )
+            """
+        )
+        self.row_count = 0
+
+    def begin(self) -> None:
+        self.conn.execute("BEGIN")
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def insert_row(self, name: str, row: Dict[str, str]) -> bool:
+        key_payload = json.dumps(sorted(row.items()), separators=(",", ":"), ensure_ascii=False)
+        data_payload = json.dumps(row, separators=(",", ":"), ensure_ascii=False)
+        cursor = self.conn.execute(
+            "INSERT OR IGNORE INTO rows (name, key, data) VALUES (?, ?, ?)",
+            (name, key_payload, data_payload),
+        )
+        if cursor.rowcount:
+            self.row_count += 1
+            return True
+        return False
+
+    def iter_rows(self, name: str) -> Iterator[Dict[str, str]]:
+        cursor = self.conn.execute(
+            "SELECT data FROM rows WHERE name = ? ORDER BY rowid",
+            (name,),
+        )
+        for (payload,) in cursor:
+            yield json.loads(payload)
+
+    def iter_table_names(self) -> Iterator[str]:
+        cursor = self.conn.execute("SELECT DISTINCT name FROM rows ORDER BY name")
+        for (name,) in cursor:
+            yield name
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        finally:
+            self._tempdir.cleanup()
 
 
 def detect_date(value: str):
@@ -159,16 +221,7 @@ def normalize_row(
     """Clean row-level issues the validator flags as errors."""
 
     if filename == "translations.txt":
-        # Drop incomplete translation entries missing required identifiers.
-        if not row.get("table_name") or not row.get("field_name"):
-            return None
-        if not row.get("language"):
-            if row.get("translation"):
-                row["language"] = "en"
-            else:
-                return None
-        if not row.get("record_id"):
-            return None
+        return None
 
     if filename == "feed_info.txt":
         url = row.get("feed_contact_url", "")
@@ -230,59 +283,83 @@ def decode_bytes(raw: bytes) -> str:
 
 
 def collect_feeds(feed_paths: List[Path]):
-    combined: Dict[str, List[Dict[str, str]]] = {}
+    store = SQLiteFeedStore()
     fieldnames: Dict[str, List[str]] = {}
-    dedupe_keys: Dict[str, set] = {}
     earliest_date = None
     feed_contexts: Dict[str, Dict[str, object]] = {}
+    skipped_feeds: List[Tuple[Path, str]] = []
 
     for feed_path in feed_paths:
         prefix = feed_path.stem
         feed_context = feed_contexts.setdefault(prefix, {})
-        with zipfile.ZipFile(feed_path, "r") as zf:
-            for member in sorted(zf.infolist(), key=lambda m: m.filename):
-                if member.is_dir():
-                    continue
-                name = member.filename
-                if not name.lower().endswith(GTFS_TXT_EXT):
-                    continue
-                with zf.open(member, "r") as fh:
-                    raw = fh.read()
-                text = decode_bytes(raw)
-                reader = csv.DictReader(io.StringIO(text))
-                header = normalize_header(reader.fieldnames or [])
-                rows = []
-                for row in reader:
-                    normalized_keys = normalize_keys(row)
-                    prefixed = apply_prefix(normalized_keys, prefix)
-                    normalized = normalize_row(name, prefixed, prefix, feed_context)
-                    if normalized is None:
+        local_fieldnames: Dict[str, List[str]] = {}
+        local_earliest = None
+        try:
+            store.begin()
+            with zipfile.ZipFile(feed_path, "r") as zf:
+                for member in sorted(zf.infolist(), key=lambda m: m.filename):
+                    if member.is_dir():
                         continue
-                    key = tuple(sorted(normalized.items()))
-                    seen = dedupe_keys.setdefault(name, set())
-                    if key in seen:
+                    name = member.filename
+                    if not name.lower().endswith(GTFS_TXT_EXT):
                         continue
-                    seen.add(key)
-                    rows.append(normalized)
-                    for date_field in DATE_FIELDS.intersection(row.keys()):
-                        candidate = detect_date(row.get(date_field, ""))
-                        if candidate is not None:
-                            if earliest_date is None or candidate < earliest_date:
-                                earliest_date = candidate
-                if not rows:
-                    continue
-                if name not in combined:
-                    combined[name] = rows
-                    fieldnames[name] = header
-                else:
-                    fieldnames[name] = merge_fieldnames(fieldnames[name], header)
-                    combined[name].extend(rows)
-    if not combined:
+                    with zf.open(member, "r") as fh:
+                        raw = fh.read()
+                    text = decode_bytes(raw)
+                    reader = csv.DictReader(io.StringIO(text))
+                    header = normalize_header(reader.fieldnames or [])
+                    observed_new_rows = False
+                    count = 0
+                    for row in reader:
+                        normalized_keys = normalize_keys(row)
+                        prefixed = apply_prefix(normalized_keys, prefix)
+                        normalized = normalize_row(name, prefixed, prefix, feed_context)
+                        if normalized is None:
+                            continue
+                        count += 1
+                        inserted = store.insert_row(name, normalized)
+                        if not inserted:
+                            continue
+                        observed_new_rows = True
+                        for date_field in DATE_FIELDS.intersection(row.keys()):
+                            candidate = detect_date(row.get(date_field, ""))
+                            if candidate is not None:
+                                if local_earliest is None or candidate < local_earliest:
+                                    local_earliest = candidate
+                    print(f"  {feed_path.name}: {name} - {count} rows")
+                    if observed_new_rows:
+                        if name not in local_fieldnames:
+                            local_fieldnames[name] = header
+                        else:
+                            local_fieldnames[name] = merge_fieldnames(local_fieldnames[name], header)
+            store.commit()
+        except Exception as exc:
+            store.rollback()
+            skipped_feeds.append((feed_path, str(exc)))
+            print(f"Skipping {feed_path} due to GTFS load error: {exc}", file=sys.stderr)
+            continue
+
+        for name, header in local_fieldnames.items():
+            if name not in fieldnames:
+                fieldnames[name] = header
+            else:
+                fieldnames[name] = merge_fieldnames(fieldnames[name], header)
+        if local_earliest is not None:
+            if earliest_date is None or local_earliest < earliest_date:
+                earliest_date = local_earliest
+
+    if store.row_count == 0:
+        store.close()
+        if skipped_feeds:
+            failed = ", ".join(path.name for path, _ in skipped_feeds)
+            raise RuntimeError(
+                f"No GTFS text files found in the provided feeds (skipped: {failed})"
+            )
         raise RuntimeError("No GTFS text files found in the provided feeds")
-    return combined, fieldnames, earliest_date
+    return store, fieldnames, earliest_date, skipped_feeds
 
 
-def write_combined_zip(output_path: Path, combined: Dict[str, List[Dict[str, str]]], fieldnames: Dict[str, List[str]]):
+def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Dict[str, List[str]]):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     reference_tables = {
         "agency": ("agency.txt", "agency_id"),
@@ -294,115 +371,124 @@ def write_combined_zip(output_path: Path, combined: Dict[str, List[Dict[str, str
     }
     reference_sets: Dict[str, set] = {}
     for table, (filename, key_field) in reference_tables.items():
-        if filename in combined:
-            keys = {row.get(key_field, "") for row in combined[filename] if row.get(key_field)}
+        if filename in fieldnames:
+            keys = set()
+            for row in store.iter_rows(filename):
+                value = row.get(key_field)
+                if value:
+                    keys.add(value)
             reference_sets[table] = keys
+
     zone_ids = set()
-    for row in combined.get("stops.txt", []):
-        zone = row.get("zone_id")
-        if zone:
-            zone_ids.add(zone)
+    if "stops.txt" in fieldnames:
+        for row in store.iter_rows("stops.txt"):
+            zone = row.get("zone_id")
+            if zone:
+                zone_ids.add(zone)
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
-        for name in sorted(combined.keys()):
-            rows = combined[name]
-            if name == "translations.txt":
-                filtered = []
-                for row in rows:
-                    table_name = row.get("table_name")
-                    record_id = row.get("record_id")
-                    if table_name not in reference_sets:
-                        continue
-                    if record_id and record_id not in reference_sets[table_name]:
-                        continue
-                    filtered.append(row)
-                rows = filtered
-            elif name == "fare_rules.txt" and zone_ids:
-                filtered = []
-                for row in rows:
-                    invalid = False
-                    for key in ("origin_id", "destination_id", "contains_id"):
-                        value = row.get(key)
-                        if value and value not in zone_ids:
-                            invalid = True
-                            break
-                    if not invalid:
-                        filtered.append(row)
-                rows = filtered
-            elif name == "trips.txt" and "shapes" in reference_sets:
-                for row in rows:
-                    if row.get("shape_id") and row["shape_id"] not in reference_sets["shapes"]:
-                        row["shape_id"] = ""
-            elif name == "stop_times.txt":
-                if "stops" in reference_sets:
-                    rows = [row for row in rows if row.get("stop_id") in reference_sets["stops"]]
-                if "trips" in reference_sets:
-                    rows = [row for row in rows if row.get("trip_id") in reference_sets["trips"]]
-                def sort_key(record: Dict[str, str]):
-                    trip = record.get("trip_id", "")
-                    seq_str = record.get("stop_sequence", "")
-                    try:
-                        seq = int(seq_str)
-                    except ValueError:
-                        seq = 0
-                    return (trip, seq)
+        for name in sorted(fieldnames.keys()):
+            header = fieldnames[name]
+            with out_zip.open(name, "w") as zip_entry:
+                with io.TextIOWrapper(zip_entry, encoding="utf-8", newline="") as text_writer:
+                    writer = csv.DictWriter(text_writer, fieldnames=header, lineterminator="\n")
+                    writer.writeheader()
 
-                rows.sort(key=sort_key)
+                    if name == "translations.txt":
+                        for row in store.iter_rows(name):
+                            table_name = row.get("table_name")
+                            record_id = row.get("record_id")
+                            if table_name not in reference_sets:
+                                continue
+                            if record_id and record_id not in reference_sets[table_name]:
+                                continue
+                            writer.writerow({key: row.get(key, "") for key in header})
+                    elif name == "fare_rules.txt" and zone_ids:
+                        for row in store.iter_rows(name):
+                            invalid = False
+                            for key in ("origin_id", "destination_id", "contains_id"):
+                                value = row.get(key)
+                                if value and value not in zone_ids:
+                                    invalid = True
+                                    break
+                            if invalid:
+                                continue
+                            writer.writerow({key: row.get(key, "") for key in header})
+                    elif name == "trips.txt" and "shapes" in reference_sets:
+                        for row in store.iter_rows(name):
+                            if row.get("shape_id") and row["shape_id"] not in reference_sets["shapes"]:
+                                row = dict(row)
+                                row["shape_id"] = ""
+                            writer.writerow({key: row.get(key, "") for key in header})
+                    elif name == "stop_times.txt":
+                        rows = list(store.iter_rows(name))
+                        if "stops" in reference_sets:
+                            rows = [row for row in rows if row.get("stop_id") in reference_sets["stops"]]
+                        if "trips" in reference_sets:
+                            rows = [row for row in rows if row.get("trip_id") in reference_sets["trips"]]
 
-                current_trip = None
-                last_time = None
-                last_shape = None
-                for row in rows:
-                    trip_id = row.get("trip_id")
-                    if trip_id != current_trip:
-                        current_trip = trip_id
+                        def sort_key(record: Dict[str, str]):
+                            trip = record.get("trip_id", "")
+                            seq_str = record.get("stop_sequence", "")
+                            try:
+                                seq = int(seq_str)
+                            except ValueError:
+                                seq = 0
+                            return (trip, seq)
+
+                        rows.sort(key=sort_key)
+
+                        current_trip = None
                         last_time = None
                         last_shape = None
+                        for row in rows:
+                            trip_id = row.get("trip_id")
+                            if trip_id != current_trip:
+                                current_trip = trip_id
+                                last_time = None
+                                last_shape = None
 
-                    arr_seconds = parse_gtfs_time(row.get("arrival_time", ""))
-                    dep_seconds = parse_gtfs_time(row.get("departure_time", ""))
+                            arr_seconds = parse_gtfs_time(row.get("arrival_time", ""))
+                            dep_seconds = parse_gtfs_time(row.get("departure_time", ""))
 
-                    if arr_seconds is not None and dep_seconds is None:
-                        dep_seconds = arr_seconds
-                        row["departure_time"] = format_gtfs_time(dep_seconds)
-                    elif dep_seconds is not None and arr_seconds is None:
-                        arr_seconds = dep_seconds
-                        row["arrival_time"] = format_gtfs_time(arr_seconds)
-
-                    if last_time is not None:
-                        if arr_seconds is not None and arr_seconds < last_time:
-                            arr_seconds = last_time
-                            row["arrival_time"] = format_gtfs_time(arr_seconds)
-                        if dep_seconds is not None:
-                            min_allowed = arr_seconds if arr_seconds is not None else last_time
-                            if dep_seconds < min_allowed:
-                                dep_seconds = min_allowed
+                            if arr_seconds is not None and dep_seconds is None:
+                                dep_seconds = arr_seconds
                                 row["departure_time"] = format_gtfs_time(dep_seconds)
+                            elif dep_seconds is not None and arr_seconds is None:
+                                arr_seconds = dep_seconds
+                                row["arrival_time"] = format_gtfs_time(arr_seconds)
 
-                    if dep_seconds is not None:
-                        last_time = dep_seconds
-                    elif arr_seconds is not None:
-                        last_time = arr_seconds
+                            if last_time is not None:
+                                if arr_seconds is not None and arr_seconds < last_time:
+                                    arr_seconds = last_time
+                                    row["arrival_time"] = format_gtfs_time(arr_seconds)
+                                if dep_seconds is not None:
+                                    min_allowed = arr_seconds if arr_seconds is not None else last_time
+                                    if dep_seconds < min_allowed:
+                                        dep_seconds = min_allowed
+                                        row["departure_time"] = format_gtfs_time(dep_seconds)
 
-                    shape_dist = row.get("shape_dist_traveled")
-                    if shape_dist:
-                        try:
-                            dist_value = float(shape_dist)
-                        except ValueError:
-                            row["shape_dist_traveled"] = ""
-                        else:
-                            if last_shape is not None and dist_value <= last_shape:
-                                row["shape_dist_traveled"] = ""
-                            else:
-                                last_shape = dist_value
-            header = fieldnames[name]
-            buffer = io.StringIO()
-            writer = csv.DictWriter(buffer, fieldnames=header, lineterminator="\n")
-            writer.writeheader()
-            for row in rows:
-                record = {key: row.get(key, "") for key in header}
-                writer.writerow(record)
-            out_zip.writestr(name, buffer.getvalue().encode("utf-8"))
+                            if dep_seconds is not None:
+                                last_time = dep_seconds
+                            elif arr_seconds is not None:
+                                last_time = arr_seconds
+
+                            shape_dist = row.get("shape_dist_traveled")
+                            if shape_dist:
+                                try:
+                                    dist_value = float(shape_dist)
+                                except ValueError:
+                                    row["shape_dist_traveled"] = ""
+                                else:
+                                    if last_shape is not None and dist_value <= last_shape:
+                                        row["shape_dist_traveled"] = ""
+                                    else:
+                                        last_shape = dist_value
+
+                            writer.writerow({key: row.get(key, "") for key in header})
+                    else:
+                        for row in store.iter_rows(name):
+                            writer.writerow({key: row.get(key, "") for key in header})
 
 
 def main():
@@ -435,7 +521,7 @@ def main():
         print("No input GTFS feeds found", file=sys.stderr)
         sys.exit(1)
 
-    combined, fieldnames, earliest_date = collect_feeds(feed_paths)
+    store, fieldnames, earliest_date, skipped_feeds = collect_feeds(feed_paths)
 
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
     if earliest_date is None:
@@ -445,12 +531,21 @@ def main():
 
     output_filename = f"{args.basename}_{start_date_token}_{timestamp}.zip"
     output_path = args.output_dir / output_filename
-    write_combined_zip(output_path, combined, fieldnames)
+
+    try:
+        write_combined_zip(output_path, store, fieldnames)
+    finally:
+        store.close()
 
     print(
         f"Combined {len(feed_paths)} feeds into {output_path} "
         f"(start_date={start_date_token}, timestamp={timestamp})"
     )
+
+    if skipped_feeds:
+        print("Skipped feeds due to load errors:", file=sys.stderr)
+        for path, message in skipped_feeds:
+            print(f"  {path}: {message}", file=sys.stderr)
 
 
 if __name__ == "__main__":
