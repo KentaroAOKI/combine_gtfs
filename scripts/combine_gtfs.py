@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 import zipfile
+import urllib.parse
 
 PREFIX_COLUMNS = {
     "agency_id",
@@ -114,11 +115,6 @@ class SQLiteFeedStore:
         for (payload,) in cursor:
             yield json.loads(payload)
 
-    def iter_table_names(self) -> Iterator[str]:
-        cursor = self.conn.execute("SELECT DISTINCT name FROM rows ORDER BY name")
-        for (name,) in cursor:
-            yield name
-
     def close(self) -> None:
         try:
             self.conn.close()
@@ -148,7 +144,8 @@ def merge_fieldnames(existing: List[str], new_fields: Iterable[str]) -> List[str
 def prefix_value(value: str, prefix: str) -> str:
     if not value:
         return value
-    return f"{prefix}_{value}"
+    encoded = urllib.parse.quote(f"{prefix}_{value}")
+    return encoded.replace("%", "")
 
 
 def apply_prefix(row: Dict[str, str], prefix: str) -> Dict[str, str]:
@@ -369,6 +366,22 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
         "stops": ("stops.txt", "stop_id"),
         "trips": ("trips.txt", "trip_id"),
     }
+    required_headers = {
+        "agency.txt": ["agency_id", "agency_name", "agency_url", "agency_timezone", "agency_lang", "agency_phone", "agency_fare_url", "agency_email"],
+        "feed_info.txt": ["feed_publisher_name", "feed_publisher_url", "feed_lang", "feed_start_date", "feed_end_date", "feed_version"],
+        "translations.txt": ["table_name", "field_name", "language", "translation", "record_id", "record_sub_id", "field_value"],
+        "routes.txt": ["route_id", "agency_id", "route_short_name", "route_long_name", "route_desc", "route_type", "route_url", "route_color", "route_text_color"],
+        "trips.txt": ["trip_id", "route_id", "service_id", "trip_headsign", "trip_short_name", "direction_id", "block_id", "shape_id", "wheelchair_accessible", "bikes_allowed"],
+        "frequencies.txt": ["trip_id", "start_time", "end_time", "headway_secs", "exact_times"],
+        "calendar.txt": ["service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "start_date", "end_date"],
+        "shapes.txt": ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence", "shape_dist_traveled"],
+        "stop_times.txt": ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence", "stop_headsign", "pickup_type", "drop_off_type", "shape_dist_traveled", "timepoint"],
+        "calendar_dates.txt": ["service_id", "date", "exception_type"],
+        "stops.txt": ["stop_id", "stop_code", "stop_name", "stop_desc", "stop_lat", "stop_lon", "zone_id", "stop_url", "location_type", "parent_station", "stop_timezone", "wheelchair_boarding", "platform_code"],
+        "transfers.txt": ["from_stop_id", "to_stop_id", "transfer_type", "min_transfer_time"],
+        "fare_attributes.txt": ["fare_id", "price", "currency_type", "payment_method", "transfers", "transfer_duration"],
+        "fare_rules.txt": ["fare_id", "route_id", "origin_id", "destination_id", "contains_id"],
+    }
     reference_sets: Dict[str, set] = {}
     for table, (filename, key_field) in reference_tables.items():
         if filename in fieldnames:
@@ -388,7 +401,9 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
         for name in sorted(fieldnames.keys()):
-            header = fieldnames[name]
+
+            header = required_headers.get(name, fieldnames[name])
+            
             with out_zip.open(name, "w") as zip_entry:
                 with io.TextIOWrapper(zip_entry, encoding="utf-8", newline="") as text_writer:
                     writer = csv.DictWriter(text_writer, fieldnames=header, lineterminator="\n")
@@ -402,7 +417,9 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
                                 continue
                             if record_id and record_id not in reference_sets[table_name]:
                                 continue
-                            writer.writerow({key: row.get(key, "") for key in header})
+                            filter_keys = required_headers.get(name, header)
+                            writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
+                            # writer.writerow({key: row.get(key, "") for key in header})
                     elif name == "fare_rules.txt" and zone_ids:
                         for row in store.iter_rows(name):
                             invalid = False
@@ -413,13 +430,16 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
                                     break
                             if invalid:
                                 continue
-                            writer.writerow({key: row.get(key, "") for key in header})
+                            filter_keys = required_headers.get(name, header)
+                            writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
+                            # writer.writerow({key: row.get(key, "") for key in header})
                     elif name == "trips.txt" and "shapes" in reference_sets:
                         for row in store.iter_rows(name):
                             if row.get("shape_id") and row["shape_id"] not in reference_sets["shapes"]:
                                 row = dict(row)
                                 row["shape_id"] = ""
-                            writer.writerow({key: row.get(key, "") for key in header})
+                            filter_keys = required_headers.get(name, header)
+                            writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
                     elif name == "stop_times.txt":
                         rows = list(store.iter_rows(name))
                         if "stops" in reference_sets:
@@ -485,10 +505,14 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
                                     else:
                                         last_shape = dist_value
 
-                            writer.writerow({key: row.get(key, "") for key in header})
+                            filter_keys = required_headers.get(name, header)
+                            writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
+                            # writer.writerow({key: row.get(key, "") for key in header})
                     else:
                         for row in store.iter_rows(name):
-                            writer.writerow({key: row.get(key, "") for key in header})
+                            filter_keys = required_headers.get(name, header)
+                            writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
+                            # writer.writerow({key: row.get(key, "") for key in header})
 
 
 def main():
