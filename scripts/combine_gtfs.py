@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import io
 import json
+import math
 import sqlite3
 import sys
 import tempfile
@@ -88,6 +89,7 @@ class SQLiteFeedStore:
         self.stop_ids = dict()
         self.route_ids = dict()
         self.stop_times = dict()
+        self.generated_shapes = dict()
         self.row_count = 0
 
     def begin(self) -> None:
@@ -270,17 +272,31 @@ def normalize_row(
             row["timepoint"] = "0"
         if not row.get("stop_sequence"):
             return None
-        store.stop_times[row.get("trip_id")] = {
-            "stop_id": row.get("stop_id", ""),
-        }
+        trip_id = row.get("trip_id")
+        stop_id = row.get("stop_id")
+        sequence_value = row.get("stop_sequence")
+        if trip_id and stop_id and sequence_value:
+            try:
+                sequence = int(sequence_value)
+            except ValueError:
+                sequence = None
+            if sequence is not None:
+                points = store.stop_times.setdefault(trip_id, [])
+                points.append((sequence, len(points), stop_id))
 
     if filename == "trips.txt":
-        if not row.get("trip_id"):
-            return None       
-        store.trip_ids[row["trip_id"]] = {
+        trip_id = row.get("trip_id")
+        if not trip_id:
+            return None
+        if not row.get("shape_id"):
+            shape_id = f"{trip_id}_gs"
+            if create_shape_for_trip(store, trip_id, shape_id, feed_context):
+                row["shape_id"] = shape_id
+        store.trip_ids[trip_id] = {
             "route_id": row.get("route_id", ""),
             "service_id": row.get("service_id", ""),
-            }
+            "shape_id": row.get("shape_id", ""),
+        }
     if filename == "routes.txt":
         if not row.get("route_id"):
             return None
@@ -290,10 +306,76 @@ def normalize_row(
     if filename == "stops.txt":
         if not row.get("stop_id"):
             return None
-        store.stop_ids[row["stop_id"]] = {
+        stop_id = row["stop_id"]
+        store.stop_ids[stop_id] = {
+            "stop_lat": row.get("stop_lat", ""),
+            "stop_lon": row.get("stop_lon", ""),
         }
 
     return row
+
+
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return radius * c
+
+
+def create_shape_for_trip(
+    store: SQLiteFeedStore,
+    trip_id: str,
+    shape_id: str,
+    feed_context: Dict[str, object],
+) -> bool:
+    if trip_id in store.generated_shapes:
+        return True
+
+    points = store.stop_times.get(trip_id)
+    if not points:
+        return False
+
+    sorted_points = sorted(points, key=lambda item: (item[0], item[1]))
+    previous_lat = None
+    previous_lon = None
+    cumulative_distance = 0.0
+    generated = False
+
+    for sequence, _, stop_id in sorted_points:
+        stop_info = store.stop_ids.get(stop_id)
+        if not stop_info:
+            continue
+        lat_str = (stop_info.get("stop_lat") or "").strip()
+        lon_str = (stop_info.get("stop_lon") or "").strip()
+        if not lat_str or not lon_str:
+            continue
+        try:
+            lat = float(lat_str)
+            lon = float(lon_str)
+        except ValueError:
+            continue
+        if previous_lat is not None and previous_lon is not None:
+            cumulative_distance += haversine_meters(previous_lat, previous_lon, lat, lon)
+        shape_row = {
+            "shape_id": shape_id,
+            "shape_pt_lat": lat_str,
+            "shape_pt_lon": lon_str,
+            "shape_pt_sequence": str(sequence),
+            "shape_dist_traveled": f"{cumulative_distance:.3f}",
+        }
+        store.insert_row("shapes.txt", shape_row)
+        generated = True
+        previous_lat = lat
+        previous_lon = lon
+
+    if generated:
+        store.generated_shapes[trip_id] = shape_id
+        feed_context["generated_shapes"] = True
+    return generated
 
 
 def decode_bytes(raw: bytes) -> str:
@@ -355,6 +437,14 @@ def collect_feeds(feed_paths: List[Path]):
                             local_fieldnames[name] = header
                         else:
                             local_fieldnames[name] = merge_fieldnames(local_fieldnames[name], header)
+            if feed_context.get("generated_shapes") and "shapes.txt" not in local_fieldnames:
+                local_fieldnames["shapes.txt"] = [
+                    "shape_id",
+                    "shape_pt_lat",
+                    "shape_pt_lon",
+                    "shape_pt_sequence",
+                    "shape_dist_traveled",
+                ]
             store.commit()
         except Exception as exc:
             store.rollback()
