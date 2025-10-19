@@ -84,6 +84,10 @@ class SQLiteFeedStore:
             )
             """
         )
+        self.trip_ids = dict()
+        self.stop_ids = dict()
+        self.route_ids = dict()
+        self.stop_times = dict()
         self.row_count = 0
 
     def begin(self) -> None:
@@ -208,12 +212,12 @@ def normalize_keys(row: Dict[str, str]) -> Dict[str, str]:
             normalized[normalized_key] = value.strip() if isinstance(value, str) else value
     return normalized
 
-
 def normalize_row(
     filename: str,
     row: Dict[str, str],
     prefix: str,
     feed_context: Dict[str, object],
+    store: SQLiteFeedStore,
 ) -> Optional[Dict[str, str]]:
     """Clean row-level issues the validator flags as errors."""
 
@@ -266,6 +270,28 @@ def normalize_row(
             row["timepoint"] = "0"
         if not row.get("stop_sequence"):
             return None
+        store.stop_times[row.get("trip_id")] = {
+            "stop_id": row.get("stop_id", ""),
+        }
+
+    if filename == "trips.txt":
+        if not row.get("trip_id"):
+            return None       
+        store.trip_ids[row["trip_id"]] = {
+            "route_id": row.get("route_id", ""),
+            "service_id": row.get("service_id", ""),
+            }
+    if filename == "routes.txt":
+        if not row.get("route_id"):
+            return None
+        store.route_ids[row["route_id"]] = {
+            "agency_id": row.get("agency_id", ""),
+        }
+    if filename == "stops.txt":
+        if not row.get("stop_id"):
+            return None
+        store.stop_ids[row["stop_id"]] = {
+        }
 
     return row
 
@@ -310,7 +336,7 @@ def collect_feeds(feed_paths: List[Path]):
                     for row in reader:
                         normalized_keys = normalize_keys(row)
                         prefixed = apply_prefix(normalized_keys, prefix)
-                        normalized = normalize_row(name, prefixed, prefix, feed_context)
+                        normalized = normalize_row(name, prefixed, prefix, feed_context, store)
                         if normalized is None:
                             continue
                         count += 1
@@ -382,6 +408,20 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
         "fare_attributes.txt": ["fare_id", "price", "currency_type", "payment_method", "transfers", "transfer_duration"],
         "fare_rules.txt": ["fare_id", "route_id", "origin_id", "destination_id", "contains_id"],
     }
+    gtfs_files = ["agency.txt",
+                     "stops.txt",
+                     "routes.txt",
+                     "trips.txt",
+                     "stop_times.txt",
+                     "calendar.txt",
+                     "calendar_dates.txt",
+                     "fare_attributes.txt",
+                     "fare_rules.txt",
+                     "shapes.txt",
+                     "frequencies.txt",
+                     "transfers.txt",
+                     "feed_info.txt",
+                     "translations.txt"]
     reference_sets: Dict[str, set] = {}
     for table, (filename, key_field) in reference_tables.items():
         if filename in fieldnames:
@@ -401,7 +441,8 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
         for name in sorted(fieldnames.keys()):
-
+            if name not in gtfs_files:
+                continue
             header = required_headers.get(name, fieldnames[name])
             
             with out_zip.open(name, "w") as zip_entry:
@@ -419,7 +460,6 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
                                 continue
                             filter_keys = required_headers.get(name, header)
                             writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
-                            # writer.writerow({key: row.get(key, "") for key in header})
                     elif name == "fare_rules.txt" and zone_ids:
                         for row in store.iter_rows(name):
                             invalid = False
@@ -432,88 +472,30 @@ def write_combined_zip(output_path: Path, store: SQLiteFeedStore, fieldnames: Di
                                 continue
                             filter_keys = required_headers.get(name, header)
                             writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
-                            # writer.writerow({key: row.get(key, "") for key in header})
-                    elif name == "trips.txt" and "shapes" in reference_sets:
+                    elif name == "trips.txt":
                         for row in store.iter_rows(name):
-                            if row.get("shape_id") and row["shape_id"] not in reference_sets["shapes"]:
-                                row = dict(row)
-                                row["shape_id"] = ""
+                            route_ok = store.route_ids.get(row.get("route_id", ""), None)
+                            if route_ok == None:
+                                continue
                             filter_keys = required_headers.get(name, header)
                             writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
                     elif name == "stop_times.txt":
                         rows = list(store.iter_rows(name))
-                        if "stops" in reference_sets:
-                            rows = [row for row in rows if row.get("stop_id") in reference_sets["stops"]]
-                        if "trips" in reference_sets:
-                            rows = [row for row in rows if row.get("trip_id") in reference_sets["trips"]]
-
-                        def sort_key(record: Dict[str, str]):
-                            trip = record.get("trip_id", "")
-                            seq_str = record.get("stop_sequence", "")
-                            try:
-                                seq = int(seq_str)
-                            except ValueError:
-                                seq = 0
-                            return (trip, seq)
-
-                        rows.sort(key=sort_key)
-
-                        current_trip = None
-                        last_time = None
-                        last_shape = None
                         for row in rows:
-                            trip_id = row.get("trip_id")
-                            if trip_id != current_trip:
-                                current_trip = trip_id
-                                last_time = None
-                                last_shape = None
-
-                            arr_seconds = parse_gtfs_time(row.get("arrival_time", ""))
-                            dep_seconds = parse_gtfs_time(row.get("departure_time", ""))
-
-                            if arr_seconds is not None and dep_seconds is None:
-                                dep_seconds = arr_seconds
-                                row["departure_time"] = format_gtfs_time(dep_seconds)
-                            elif dep_seconds is not None and arr_seconds is None:
-                                arr_seconds = dep_seconds
-                                row["arrival_time"] = format_gtfs_time(arr_seconds)
-
-                            if last_time is not None:
-                                if arr_seconds is not None and arr_seconds < last_time:
-                                    arr_seconds = last_time
-                                    row["arrival_time"] = format_gtfs_time(arr_seconds)
-                                if dep_seconds is not None:
-                                    min_allowed = arr_seconds if arr_seconds is not None else last_time
-                                    if dep_seconds < min_allowed:
-                                        dep_seconds = min_allowed
-                                        row["departure_time"] = format_gtfs_time(dep_seconds)
-
-                            if dep_seconds is not None:
-                                last_time = dep_seconds
-                            elif arr_seconds is not None:
-                                last_time = arr_seconds
-
-                            shape_dist = row.get("shape_dist_traveled")
-                            if shape_dist:
-                                try:
-                                    dist_value = float(shape_dist)
-                                except ValueError:
-                                    row["shape_dist_traveled"] = ""
-                                else:
-                                    if last_shape is not None and dist_value <= last_shape:
-                                        row["shape_dist_traveled"] = ""
-                                    else:
-                                        last_shape = dist_value
-
+                            stop_ok = store.stop_ids.get(row.get("stop_id", ""), None)
+                            trip_ok = store.trip_ids.get(row.get("trip_id", ""), None)
+                            if trip_ok is not None:
+                                route_ok = store.route_ids.get(trip_ok.get("route_id", ""), None)
+                            else:
+                                route_ok = None
+                            if stop_ok == None or route_ok == None:
+                                continue
                             filter_keys = required_headers.get(name, header)
                             writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
-                            # writer.writerow({key: row.get(key, "") for key in header})
                     else:
                         for row in store.iter_rows(name):
                             filter_keys = required_headers.get(name, header)
                             writer.writerow({key: row.get(key, "") for key in header if key in filter_keys})
-                            # writer.writerow({key: row.get(key, "") for key in header})
-
 
 def main():
     parser = argparse.ArgumentParser(description="Combine multiple GTFS feeds into one archive with prefixed IDs")
